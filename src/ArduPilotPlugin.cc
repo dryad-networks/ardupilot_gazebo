@@ -31,6 +31,7 @@
 
 #include <gz/common/SignalHandler.hh>
 #include <gz/msgs/Utility.hh>
+#include <gz/sim/components/Model.hh>
 #include <gz/sim/components/CustomSensor.hh>
 #include <gz/sim/components/Imu.hh>
 #include <gz/sim/components/Joint.hh>
@@ -65,6 +66,8 @@
 // MAX_MOTORS limits the maximum number of <control> elements that
 // can be defined in the <plugin>.
 #define MAX_MOTORS 255
+
+#define MAX_RANGE_SENS 6
 
 // Register plugin
 GZ_ADD_PLUGIN(gz::sim::systems::ArduPilotPlugin,
@@ -236,6 +239,9 @@ class gz::sim::systems::ArduPilotPluginPrivate
   /// \brief The name of the IMU sensor
   public: std::string imuName;
 
+  /// \brief The name of the Range sensor
+  public: std::vector<std::string> rngSensName;
+
   /// \brief Set true to enforce lock-step simulation
   public: bool isLockStep{false};
 
@@ -244,6 +250,9 @@ class gz::sim::systems::ArduPilotPluginPrivate
 
   /// \brief Have we initialized subscription to the IMU data yet?
   public: bool imuInitialized{false};
+
+  /// \brief Have we initialized subscription to the Range data yet?
+  public: bool rngFndInitialized{false};
 
   /// \brief We need an gz-transport Node to subscribe to IMU data
   public: gz::transport::Node node;
@@ -878,115 +887,17 @@ void gz::sim::systems::ArduPilotPlugin::LoadRangeSensors(
     sdf::ElementPtr _sdf,
     gz::sim::EntityComponentManager &/*_ecm*/)
 {
-    struct SensorIdentifier
-    {
-        std::string type;
-        int index;
-        std::string topic;
-    };
-    std::vector<SensorIdentifier> sensorIds;
 
-    // read sensor elements
-    sdf::ElementPtr sensorSdf;
-    if (_sdf->HasElement("sensor"))
-    {
-        sensorSdf = _sdf->GetElement("sensor");
-    }
-
-    while (sensorSdf)
-    {
-        SensorIdentifier sensorId;
-
-        // <type> is required
-        if (sensorSdf->HasElement("type"))
-        {
-            sensorId.type = sensorSdf->Get<std::string>("type");
-        }
-        else
-        {
-            gzwarn << "[" << this->dataPtr->modelName << "] "
-                << "sensor element 'type' not specified, skipping.\n";
-        }
-
-        // <index> is required
-        if (sensorSdf->HasElement("index"))
-        {
-            sensorId.index = sensorSdf->Get<int>("index");
-        }
-        else
-        {
-            gzwarn << "[" << this->dataPtr->modelName << "] "
-                << "sensor element 'index' not specified, skipping.\n";
-        }
-
-        // <topic> is required
-        if (sensorSdf->HasElement("topic"))
-        {
-            sensorId.topic = sensorSdf->Get<std::string>("topic");
-        }
-        else
-        {
-            gzwarn << "[" << this->dataPtr->modelName << "] "
-                << "sensor element 'topic' not specified, skipping.\n";
-        }
-
-        sensorIds.push_back(sensorId);
-
-        sensorSdf = sensorSdf->GetNextElement("sensor");
-
-        gzmsg << "[" << this->dataPtr->modelName << "] range "
-            << "type: " << sensorId.type
-            << ", index: " << sensorId.index
-            << ", topic: " << sensorId.topic
-            << "\n";
-    }
-
-    /// \todo(anyone) gazebo classic has different rules for generating
-    /// topic names, gazebo sim would benefit from similar rules when providing
-    /// topics names in sdf sensors elements.
-
-    // get the topic prefix
-    // std::string topicPrefix = "~/";
-    // topicPrefix += this->dataPtr->modelName;
-    // boost::replace_all(topicPrefix, "::", "/");
-
-    // subscriptions
-    for (auto &&sensorId : sensorIds)
-    {
-        /// \todo(anyone) see comment above re. topics
-        /// fully qualified topic name
-        /// std::string topicName = topicPrefix;
-        /// topicName.append("/").append(sensorId.topic);
-        std::string topicName = sensorId.topic;
-
-        // Bind the sensor index to the callback function
-        // (adjust from unit to zero offset)
-        OnMessageWrapper<gz::msgs::LaserScan>::callback_t fn =
-            std::bind(
-                &gz::sim::systems::ArduPilotPluginPrivate::RangeCb,
-                this->dataPtr.get(),
-                std::placeholders::_1,
-                sensorId.index - 1);
-
-        // Wrap the std::function so we can register the callback
-        auto callbackWrapper = RangeOnMessageWrapperPtr(
-            new OnMessageWrapper<gz::msgs::LaserScan>(fn));
-
-        auto callback = &OnMessageWrapper<gz::msgs::LaserScan>::OnMessage;
-
-        // Subscribe to range sensor topic
-        this->dataPtr->node.Subscribe(
-            topicName, callback, callbackWrapper.get());
-
-        this->dataPtr->rangeCbs.push_back(callbackWrapper);
-
-        /// \todo(anyone) initalise ranges properly
-        /// (AP convention for ignored value?)
-        this->dataPtr->ranges.push_back(-1.0);
-
-        gzmsg << "[" << this->dataPtr->modelName << "] subscribing to "
-              << topicName << "\n";
-    }
+	for(int sensor_index=0 ; sensor_index < MAX_RANGE_SENS; sensor_index++)
+	{
+		std::string scopeName = _sdf->Get("rngFnd"+std::to_string(sensor_index+1),
+				static_cast<std::string>("gpu_lidar_"+std::to_string(sensor_index+1))).first;
+		if(scopeName != "gpu_lidar_"+std::to_string(sensor_index+1))
+		{
+			this->dataPtr->rngSensName.push_back(scopeName);
+			gzwarn << "rngSensName["<<std::to_string(sensor_index+1) <<"]  : " << scopeName  << "\n";
+		}
+	}
 }
 
 /////////////////////////////////////////////////
@@ -1216,6 +1127,108 @@ void gz::sim::systems::ArduPilotPlugin::PreUpdate(
                 this->ApplyMotorForces(dt, _ecm);
             }
         }
+    }
+
+    if (!this->dataPtr->rngFndInitialized)
+    {
+        // Set unconditionally because we're only going to try this once.
+    	this->dataPtr->rngFndInitialized = true;
+        // The model must contain an imu sensor element:
+        //  <sensor name="..." type="gpu_lidar">
+        //
+        // Extract the following:
+        //  - Sensor topic name: to subscribe to the imu data
+        //  - Link containing the sensor: to get the pose to transform to
+        //    the correct frame for ArduPilot
+
+        // try scoped names first
+    	for(int sensor_index = 0; sensor_index < this->dataPtr->rngSensName.size(); sensor_index++)
+    	{
+			auto entities = entitiesFromScopedName(
+				this->dataPtr->rngSensName[sensor_index] , _ecm, this->dataPtr->model.Entity());
+
+			// fall-back to unscoped name
+			if (entities.empty())
+			{
+			  entities = EntitiesFromUnscopedName(
+				this->dataPtr->rngSensName[sensor_index] , _ecm, this->dataPtr->model.Entity());
+			}
+
+			if (!entities.empty())
+			{
+			  if (entities.size() > 1)
+			  {
+				gzwarn << "Multiple link rng sensors with name ["
+					   << this->dataPtr->rngSensName[sensor_index]  << "] found. "
+					   << "Using the first one.\n";
+			  }
+
+			  // select first entity
+			  gz::sim::Entity imuEntity = *entities.begin();
+
+			  // validate
+			  if (!_ecm.EntityHasComponentType(imuEntity,
+				  gz::sim::components::Sensor::typeId))
+			  {
+				gzerr << "Entity with name ["
+					  << this->dataPtr->rngSensName[sensor_index]
+					  << "] is not an link rng sensor\n";
+			  }
+			  else
+			  {
+				gzmsg << "Found link rng sensor with name ["
+					  << this->dataPtr->rngSensName[sensor_index]
+					  << "]\n";
+
+				// verify the parent of the imu sensor is a link.
+				gz::sim::Entity parent = _ecm.ParentEntity(imuEntity);
+				if (_ecm.EntityHasComponentType(parent,
+					gz::sim::components::Link::typeId))
+				{
+					std::string topicName = "/lidar_"+std::to_string(sensor_index+1);//gz::sim::scopedName(imuEntity, _ecm) + "/lidar_"+ std::to_string(sensor_index+1);
+
+			        // Bind the sensor index to the callback function
+			        // (adjust from unit to zero offset)
+			        OnMessageWrapper<gz::msgs::LaserScan>::callback_t fn =
+			            std::bind(
+			                &gz::sim::systems::ArduPilotPluginPrivate::RangeCb,
+			                this->dataPtr.get(),
+			                std::placeholders::_1,
+			                sensor_index);
+
+			        // Wrap the std::function so we can register the callback
+			        auto callbackWrapper = RangeOnMessageWrapperPtr(
+			            new OnMessageWrapper<gz::msgs::LaserScan>(fn));
+
+			        auto callback = &OnMessageWrapper<gz::msgs::LaserScan>::OnMessage;
+
+			        // Subscribe to range sensor topic
+			        this->dataPtr->node.Subscribe(
+			            topicName, callback, callbackWrapper.get());
+
+			        this->dataPtr->rangeCbs.push_back(callbackWrapper);
+
+			        /// \todo(anyone) initalise ranges properly
+			        /// (AP convention for ignored value?)
+			        this->dataPtr->ranges.push_back(-1.0);
+
+			        gzmsg << "[" << this->dataPtr->modelName << "] subscribing to "
+			              << topicName << "\n";
+				}
+				else
+				{
+				  gzerr << "Parent of lidar sensor ["
+						<< this->dataPtr->rngSensName[sensor_index]
+						<< "] is not a link\n";
+				}
+			  }
+			}
+			else
+			{
+				gzerr << "[lidar] not found" << "\n";
+				return;
+			}
+    	}
     }
 }
 
